@@ -1,60 +1,76 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib
-import numpy as np
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-import re
-import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
+import nltk
+import pickle
+import re
+import pymongo
+from datetime import datetime
 
-# Download NLTK resources (once)
-nltk.download('stopwords')
-nltk.download('wordnet')
+# Download required NLTK data
+nltk.download("stopwords")
+nltk.download("wordnet")
 
-# Load tokenizer and model
-tokenizer = joblib.load("backend/model/tokenizer.pkl")
+# ========== MongoDB Setup ==========
+client = pymongo.MongoClient("mongodb://localhost:27017/")
+db = client["insta_spam_db"]
+collection = db["predictions"]
+
+# ========== App Setup ==========
+app = FastAPI()
+
+# ========== Load LSTM Model ==========
 model = load_model("backend/model/spam_lstm_model.h5")
 
-# Text preprocessing
-stop_words = set(stopwords.words('english'))
+# ========== Load Tokenizer ==========
+with open("backend/model/tokenizer.pkl", "rb") as f:
+    tokenizer = pickle.load(f)
+
+# ========== Text Preprocessing ==========
+stop_words = set(stopwords.words("english"))
 lemmatizer = WordNetLemmatizer()
 
-def clean_text(text):
+def preprocess_text(text):
+    text = re.sub(r"http\S+|www\S+|@\w+|[^A-Za-z\s]", "", text)
     text = text.lower()
-    text = re.sub(r"http\S+|www\S+|https\S+", "", text)
-    text = re.sub(r'\@w+|\#','', text)
-    text = re.sub(r'[^A-Za-z\s]', '', text)
     words = text.split()
     words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words]
     return " ".join(words)
 
-# FastAPI app
-app = FastAPI()
-
-class Comment(BaseModel):
+# ========== Request Schema ==========
+class CommentInput(BaseModel):
     text: str
 
-@app.get("/")
-def read_root():
-    return {"message": "Instagram Spam Detection API with LSTM is live!"}
-
+# ========== API Route ==========
 @app.post("/predict")
-def predict_spam(comment: Comment):
-    cleaned = clean_text(comment.text)
+def predict_spam(data: CommentInput):
+    raw_text = data.text
+    cleaned_text = preprocess_text(raw_text)
+    sequences = tokenizer.texts_to_sequences([cleaned_text])
+    padded = pad_sequences(sequences, maxlen=100)
 
-    # Tokenize and pad
-    sequence = tokenizer.texts_to_sequences([cleaned])
-    padded = pad_sequences(sequence, maxlen=100)
+    try:
+        prediction = model.predict(padded)[0][0]
+        label = "Spam" if prediction >= 0.5 else "Not Spam"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
 
-    # Predict
-    prediction = model.predict(padded)[0][0]
-    label = "spam" if prediction > 0.5 else "not spam"
-
-    return {
+    # Save to MongoDB
+    record = {
+        "input": raw_text,
+        "cleaned": cleaned_text,
         "prediction": label,
         "probability": float(prediction),
-        "input": comment.text,
-        "cleaned": cleaned
+        "timestamp": datetime.utcnow()
+    }
+    collection.insert_one(record)
+
+    return {
+        "input": raw_text,
+        "cleaned": cleaned_text,
+        "prediction": label,
+        "probability": float(prediction)
     }
